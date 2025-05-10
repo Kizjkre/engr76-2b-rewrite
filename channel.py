@@ -4,10 +4,16 @@ from scipy.signal import firls, lfilter, minimum_phase
 from scipy.io.wavfile import read, write
 import os
 from datetime import datetime
+import warnings
 
 
 fs = 44100
-_default_response = np.array([0.010, 0.011, 0.008, 0.018, 0.024, 0.025, 0.054, 0.088, 0.129, 0.166, 0.152, 0.149, 0.275, 0.405, 0.379, 0.189, 0.185, 0.133, 0.121, 0.080, 0.073, 0.054, 0.045, 0.024, 0.018, 0.041, 0.061, 0.055, 0.013, 0.046])
+def save(signal, directory: str="channel_outputs/", filename: str=""):
+    filename += "no_noise" + datetime.now().strftime("%m%d-%H%M%S%f") + ".wav"
+    write(os.path.join(directory, filename), fs, signal.astype(np.float32))
+    print(f"Saved output to {directory}{filename}")
+
+_default_response = np.array([0.014, 0.019, 0.02, 0.043, 0.07, 0.103, 0.137, 0.126, 0.122, 0.227, 0.334, 0.313, 0.173, 0.183, 0.158, 0.163, 0.061, 0.06, 0.11, 0.162, 0.152, 0.076, 0.074, 0.053, 0.048, 0.032, 0.029, 0.022, 0.018, 0.01])
 _default_freqs = np.logspace(np.log10(200), np.log10(5000), 30)
 
 def _delay(signal, time):
@@ -41,10 +47,8 @@ def _load_wavs(dir_name):
                 loaded.append(read(os.path.join(directory, filename))[1])
     return loaded
 
-class SimulatedChannel:
+class Channel:
     def __init__(self, measured_freqs=None, response=None, claps=None, talking=None):
-        #TODO: input validation
-
         if measured_freqs is None:
             measured_freqs = _default_freqs
         if response is None:
@@ -53,7 +57,7 @@ class SimulatedChannel:
         #generate filters
         bands = np.pad(measured_freqs, 1, constant_values=(0,fs/2))
         desired = np.pad(response, 1)
-        desired /= np.max(desired)
+        # desired /= np.max(desired)
         self.system_filter = firls(101, bands, desired, fs=fs)
         self.system_filter = minimum_phase(self.system_filter)
         self.noise_filter = firls(101, bands, np.sqrt(desired), fs=fs)
@@ -108,32 +112,57 @@ class SimulatedChannel:
         actual_power = np.mean(output**2)
         output *= np.sqrt(power/actual_power)
         return output
-    def _noise(self, signal, noise_var, avg_wait, clap_amp, talking_pow, gain_variation=1/900):
-        delay0 = self.rng.uniform(low=0.1, high=0.5)
+    def _noise(self, signal, noise_var, avg_wait, clap_amp, talking_pow, gain_variation=1/900, gain=None, speaker_noise_var=0):
+        delay0 = self.rng.uniform(low=0.15, high=0.35)
         signal = _delay(signal, delay0)
         signal = lfilter(self.system_filter, 1, signal)
         noise = self.rng.normal(loc=0, scale=np.sqrt(noise_var), size=signal.shape)
         noise = lfilter(self.noise_filter, 1, noise)
+        if speaker_noise_var > 0:
+            speaker_noise = self.rng.normal(loc=0, scale=np.sqrt(speaker_noise_var), size=signal.shape)
+            speaker_noise = lfilter(self.system_filter, 1, speaker_noise)
+            noise += _delay(speaker_noise, delay0)
+        if gain is None:
+            gain = self.rng.uniform(low=0.9, high=1.1)
+        signal *= gain
         if avg_wait is not None:
-            noise += _delay(self._clap_noise(signal.size, clap_amp, avg_wait), delay0)
+            noise += self._clap_noise(signal.size, clap_amp, avg_wait)
         if talking_pow is not None:
             noise += _delay(self._talking_noise(signal.size, talking_pow), delay0)
         signal += noise
         signal *= np.exp(self._generate_loudness(signal.size, gain_variation))
-        return _delay(_clip(signal), self.rng.uniform(low=0.1, high=0.5))
-    def simulate(self, signal:np.ndarray, clap: bool=False, talking: bool=False, save_wav: bool=True, directory: str="channel_outputs/") -> np.ndarray:
-        #TODO: input validation
-        output = self._noise(signal, 0.0005, 1 if clap else None, 2, 0.0005 if talking else None)
+        return _delay(_clip(signal), self.rng.uniform(low=0.15, high=0.35))
+    def transmit(self, signal:np.ndarray, alt: bool=False, clap: bool=False, talking: bool=False, save_wav: bool=True, directory: str="channel_outputs/", filename: str="") -> np.ndarray:
+        """Transmit a signal through the channel.
+        
+        Input variables:
+            - signal:     1-D array of floats representing the input signal
+            - alt:        if True, apply an alternate noise level
+            - clap:       if True, add clapping interference
+            - talking:    if True, add talking interference
+            - save_wav:   if True, save the output to a .wav file
+            - directory:  path to output directory for saved .wav file
+            - filename:   optional base filename to prepend to output file
+            
+        Output variables:
+            - received:   1-D array of floats representing the received signal
+        """
+        if not isinstance(signal, np.ndarray):
+            raise TypeError(f"Input is of type {type(signal).__name__}, but should be a NumPy array.")
+        if signal.ndim != 1:
+            raise ValueError(f"Invalid input shape {signal.shape}.")
+        if not np.issubdtype(signal.dtype, np.floating):
+            raise ValueError(f"Signal has dtype {signal.dtype}, but should be floating point and real.")
+        input_max_idx = np.argmax(np.abs(signal))
+        if np.abs(signal[input_max_idx]) > 1:
+            warnings.warn(f"Input contains large value {signal[input_max_idx]} at {input_max_idx}, which may cause clipping.", warnings.RuntimeWarning)
+        received = self._noise(signal, 0.0005, 0.5 if clap else None, 2, 0.0005 if talking else None, gain=None, speaker_noise_var=0.5 if alt else 0)
         if save_wav:
-            filename = ("_clap" if clap else "") + ("_talk" if talking else "") + ".wav"
-            filename = datetime.now().strftime("%m%d-%H%M%S%f") + filename
-            write(os.path.join(directory, filename), fs, output.astype(np.float32))
+            filename += ("_clap" if clap else "") + ("_talk" if talking else "")
+            filename = filename + datetime.now().strftime("%m%d-%H%M%S%f")  + ".wav"
+            write(os.path.join(directory, filename), fs, received.astype(np.float32))
             print(f"Saved output to {directory}{filename}")
-        return output
-    def play(self, signal, directory: str="channel_outputs/"):
-        filename = datetime.now().strftime("%m%d-%H%M%S%f") + "no_noise.wav"
-        write(os.path.join(directory, filename), fs, signal.astype(np.float32))
-        print(f"Saved output to {directory}{filename}")
+        return received
 
 
 
